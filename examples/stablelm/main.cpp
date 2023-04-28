@@ -83,14 +83,22 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
         return false;
     }
 
+    bool align_tensors = false;
     // verify magic
     {
         uint32_t magic;
         fin.read((char *) &magic, sizeof(magic));
         if (magic == 0x67676d6c) { // ggml
             printf("%s: magic = %d\n", __func__, magic);
-        } else if (magic == 0x67676d66) { //ggmf
+        } else if (magic == 0x67676d66) { // ggmf
             // versioned
+            uint32_t version;
+            fin.read((char *) &version, sizeof(version));
+            printf("%s: magic = %d\n", __func__, magic);
+            printf("%s: version = %d\n", __func__, version);
+        } else if (magic == 0x67676a74) { // ggjt
+            // versioned and tensor aligned to 32 bytes
+            align_tensors = true;
             uint32_t version;
             fin.read((char *) &version, sizeof(version));
             printf("%s: magic = %d\n", __func__, magic);
@@ -308,6 +316,7 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
         printf("%s: ", __func__);
 
         while (true) {
+            
             int32_t n_dims;
             int32_t length;
             int32_t ttype;
@@ -319,7 +328,7 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
             if (fin.eof()) {
                 break;
             }
-
+            
             int32_t nelements = 1;
             int32_t ne[2] = { 1, 1 };
             for (int i = 0; i < n_dims; ++i) {
@@ -358,6 +367,16 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
                 fprintf(stderr, "%s: tensor '%s' has wrong size in model file: got %zu, expected %zu\n",
                         __func__, name.data(), ggml_nbytes(tensor), nelements*bpe);
                 return false;
+            }
+            
+            if (align_tensors) {
+                // skip to the next multiple of 32 bytes
+                size_t pos = fin.tellg();
+                size_t off = (pos % 32); // if off is 0 then we are already 32 byte aligned
+                if (off > 0) {
+                    fin.seekg(32 - off, fin.cur);
+                }
+                //fin.seek(-file.tell() & 31, SEEK_CUR);
             }
 
             fin.read(reinterpret_cast<char *>(tensor->data), ggml_nbytes(tensor));
@@ -757,9 +776,22 @@ int main(int argc, char ** argv) {
 
     std::vector<float> logits;
     
+    // MARK: OpenAssistant
+    auto prompt_prompter_id = vocab.token_to_id["<|prompter|>"];
+    auto prompt_endoftext_id = vocab.token_to_id["<|endoftext|>"];
+    auto prompt_assistant_id = vocab.token_to_id["<|assistant|>"];
+    // tokenize the user prompt
+    std::vector<gpt_vocab::id> user_prompt_ids = ::gpt_tokenize(vocab, params.prompt);
+    // concat all token ids for embd_inp
+    std::vector<gpt_vocab::id> embd_inp = std::vector<gpt_vocab::id>();
+    embd_inp.push_back(prompt_prompter_id); // prompter
+    embd_inp.insert(embd_inp.end(), user_prompt_ids.begin(), user_prompt_ids.end());
+    embd_inp.push_back(prompt_endoftext_id); // endoftext
+    embd_inp.push_back(prompt_assistant_id); // assistant
+    
     // MARK: "Base" StableLM - are bos or eos tokens used in prompt or just simple sentence completion? in this case bos and eos are the same token id (0), my guess is sentence completion only for base model (no bos/eos)
     // tokenize the user prompt
-    std::vector<gpt_vocab::id> embd_inp = ::gpt_tokenize(vocab, params.prompt);
+    //std::vector<gpt_vocab::id> embd_inp = ::gpt_tokenize(vocab, params.prompt);
     
     // MARK: "Tuned" StableLM - special tokens are used for a more professional chat assistant
     /*
@@ -814,6 +846,7 @@ int main(int argc, char ** argv) {
 
         n_past += embd.size();
         embd.clear();
+        bool generating = true;
 
         if (i >= embd_inp.size()) {
             // sample next token
@@ -836,6 +869,7 @@ int main(int argc, char ** argv) {
             // add it to the context
             embd.push_back(id);
         } else {
+            generating = false;
             // if here, it means we are still processing the input prompt
             for (int k = i; k < embd_inp.size(); k++) {
                 embd.push_back(embd_inp[k]);
@@ -851,6 +885,9 @@ int main(int argc, char ** argv) {
             printf("%s", vocab.id_to_token[id].c_str());
         }
         fflush(stdout);
+        
+        // skip eos check for input
+        if (!generating) continue;
 
         // end of text token
         if (embd.back() == 0) {
