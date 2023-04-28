@@ -11,17 +11,12 @@ if len(sys.argv) < 3:
     print("  ftype == 0 -> float32")
     print("  ftype == 1 -> float16")
     sys.exit(1)
-
-# output in the same directory as the model
-dir_model = sys.argv[1]
-fname_out = sys.argv[1] + "/ggml-model.bin"
-
-with open(dir_model + "/tokenizer.json", "r", encoding="utf-8") as f:
-    encoder = json.load(f)
-
-with open(dir_model + "/config.json", "r", encoding="utf-8") as f:
-    hparams = json.load(f)
-
+    
+# ftype
+ftype = 1
+if len(sys.argv) > 2:
+    ftype = int(sys.argv[2])
+    
 # possible data types
 #   ftype == 0 -> float32
 #   ftype == 1 -> float16
@@ -29,14 +24,14 @@ with open(dir_model + "/config.json", "r", encoding="utf-8") as f:
 # map from ftype to string
 ftype_str = ["f32", "f16"]
 
-ftype = 1
-if len(sys.argv) > 2:
-    ftype = int(sys.argv[2])
-    if ftype < 0 or ftype > 1:
-        print("Invalid ftype: " + str(ftype))
-        sys.exit(1)
-    fname_out = sys.argv[1] + "/ggml-model-" + ftype_str[ftype] + ".bin"
+# h5 model is the directory that contains the tokenizer, config, weights, etc
+dir_model = sys.argv[1]
 
+with open(dir_model + "/tokenizer.json", "r", encoding="utf-8") as f:
+    encoder = json.load(f)
+
+with open(dir_model + "/config.json", "r", encoding="utf-8") as f:
+    hparams = json.load(f)
 
 tokenizer = AutoTokenizer.from_pretrained(dir_model)
 model = AutoModelForCausalLM.from_pretrained(dir_model, low_cpu_mem_usage=True)
@@ -47,18 +42,29 @@ model = AutoModelForCausalLM.from_pretrained(dir_model, low_cpu_mem_usage=True)
 list_vars = model.state_dict()
 for name in list_vars.keys():
     print(name, list_vars[name].shape, list_vars[name].dtype)
-
-fout = open(fname_out, "wb")
-
+    
 print(hparams)
 
-fout.write(struct.pack("i", 0x67676d6c)) # magic: ggml in hex
+# create new model in same directory as model, not within the old model
+# it is reasonable to think many people will remove the h5 model once completed so no move necessary
+# TODO: Create arg for in model (e.g. dir_model/ggml-model-f16.bin) or parent dir (e.g. ggml-{model_name}-f16.bin}
+fn_bin = f"ggml-{dir_model.split('/')[-1]}-{ftype_str[ftype]}.bin"
+fn_out = dir_model + "/../" + fn_bin
+fout = open(fn_out, "wb")
+
+ggml_file_magic = 0x67676d66 # 0x67676d6c is unversioned
+ggml_file_version = 0x00000001 # v1
+
+hparams["multiple_of"] = 1
+fout.write(struct.pack("i", ggml_file_magic)) # magic: ggmf in hex
+fout.write(struct.pack("i", ggml_file_version))
 fout.write(struct.pack("i", hparams["vocab_size"]))
 fout.write(struct.pack("i", hparams["max_position_embeddings"]))
 fout.write(struct.pack("i", hparams["hidden_size"]))
 fout.write(struct.pack("i", hparams["num_attention_heads"]))
 fout.write(struct.pack("i", hparams["num_hidden_layers"]))
 fout.write(struct.pack("i", int(hparams["rotary_pct"]*(hparams["hidden_size"]//hparams["num_attention_heads"]))))
+fout.write(struct.pack("i", int(hparams["use_parallel_residual"])))
 fout.write(struct.pack("i", ftype))
 
 # TODO: temporary hack to not deal with implementing the tokenizer
@@ -112,5 +118,5 @@ for name in list_vars.keys():
 
 fout.close()
 
-print("Done. Output file: " + fname_out)
+print("Done. Output file: " + fn_out)
 print("")

@@ -22,6 +22,7 @@ struct stablelm_hparams {
     int32_t n_head  = 32;
     int32_t n_layer = 16;
     int32_t n_rot   = 32; // rotary_pct * (n_embd / n_head)
+    int32_t use_parallel_residual = 1;
     int32_t ftype   = 1;
 };
 
@@ -68,7 +69,7 @@ struct stablelm_model {
     struct ggml_tensor * memory_v;
 
     //
-    struct ggml_context * ctx;
+    struct ggml_context * ctx = NULL;
     std::map<std::string, struct ggml_tensor *> tensors;
 };
 
@@ -86,7 +87,15 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
     {
         uint32_t magic;
         fin.read((char *) &magic, sizeof(magic));
-        if (magic != 0x67676d6c) {
+        if (magic == 0x67676d6c) { // ggml
+            printf("%s: magic = %d\n", __func__, magic);
+        } else if (magic == 0x67676d66) { //ggmf
+            // versioned
+            uint32_t version;
+            fin.read((char *) &version, sizeof(version));
+            printf("%s: magic = %d\n", __func__, magic);
+            printf("%s: version = %d\n", __func__, version);
+        } else {
             fprintf(stderr, "%s: invalid model file '%s' (bad magic)\n", __func__, fname.c_str());
             return false;
         }
@@ -102,6 +111,7 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
         fin.read((char *) &hparams.n_head,  sizeof(hparams.n_head));
         fin.read((char *) &hparams.n_layer, sizeof(hparams.n_layer));
         fin.read((char *) &hparams.n_rot,   sizeof(hparams.n_rot));
+        fin.read((char *) &hparams.use_parallel_residual,   sizeof(hparams.use_parallel_residual));
         fin.read((char *) &hparams.ftype,   sizeof(hparams.ftype));
 
         printf("%s: n_vocab = %d\n", __func__, hparams.n_vocab);
@@ -110,6 +120,7 @@ bool stablelm_model_load(const std::string & fname, stablelm_model & model, gpt_
         printf("%s: n_head  = %d\n", __func__, hparams.n_head);
         printf("%s: n_layer = %d\n", __func__, hparams.n_layer);
         printf("%s: n_rot   = %d\n", __func__, hparams.n_rot);
+        printf("%s: use_parallel_residual = %d\n", __func__, hparams.use_parallel_residual);
         printf("%s: ftype   = %d\n", __func__, hparams.ftype);
     }
 
@@ -417,7 +428,8 @@ bool stablelm_eval(
     };
 
     struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph gf = { .n_threads = n_threads };
+    struct ggml_cgraph gf = {};
+    gf.n_threads = N >= 32 && ggml_cpu_has_blas() && !ggml_cpu_has_cublas() ? 1 : n_threads;
 
     struct ggml_tensor * embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
     memcpy(embd->data, embd_inp.data(), N*ggml_element_size(embd));
@@ -427,6 +439,8 @@ bool stablelm_eval(
 
     for (int il = 0; il < n_layer; ++il) {
         struct ggml_tensor * cur;
+        
+        //lctx.use_buf(ctx0, 0);
 
         // self-attention
         {
@@ -451,9 +465,59 @@ bool stablelm_eval(
                         cur);
             }
 
-            struct ggml_tensor * Qcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd/n_head, n_head, N, cur->nb[1]/n_head, cur->nb[1], 0*sizeof(float)*n_embd/n_head));
-            struct ggml_tensor * Kcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd/n_head, n_head, N, cur->nb[1]/n_head, cur->nb[1], 1*sizeof(float)*n_embd/n_head));
-            struct ggml_tensor * Vcur = ggml_cont(ctx0, ggml_view_3d(ctx0, cur, n_embd/n_head, n_head, N, cur->nb[1]/n_head, cur->nb[1], 2*sizeof(float)*n_embd/n_head));
+            // MARK: Check if this split is better/faster than my split from https://github.com/byroneverson/gptneox.cpp
+            // Split QKV and make contiguous
+            struct ggml_tensor * Qcur = ggml_view_3d(ctx0, cur,
+                                            n_embd/n_head,
+                                            n_head,
+                                            N,
+                                            ggml_element_size(cur) * 3 * n_embd/n_head,
+                                            ggml_element_size(cur) * 3 * n_embd,
+                                            ggml_element_size(cur) * n_embd/n_head * 0);
+            struct ggml_tensor * Kcur = ggml_view_3d(ctx0, cur,
+                                            n_embd/n_head,
+                                            n_head,
+                                            N,
+                                            ggml_element_size(cur) * 3 * n_embd/n_head,
+                                            ggml_element_size(cur) * 3 * n_embd,
+                                            ggml_element_size(cur) * n_embd/n_head * 1);
+            struct ggml_tensor * Vcur = ggml_view_3d(ctx0, cur,
+                                            n_embd/n_head,
+                                            n_head,
+                                            N,
+                                            ggml_element_size(cur) * 3 * n_embd/n_head,
+                                            ggml_element_size(cur) * 3 * n_embd,
+                                            ggml_element_size(cur) * n_embd/n_head * 2);
+            // TODO: Flatten without copying, or see if non-contiguous can be used for any of QKV.
+            Qcur = ggml_cpy(ctx0, Qcur,
+                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd/n_head, n_head, N));
+            Kcur = ggml_cpy(ctx0, Kcur,
+                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd/n_head, n_head, N));
+            Vcur = ggml_cpy(ctx0, Vcur,
+                        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd/n_head, n_head, N));
+            
+            /*struct ggml_tensor * Qcur = ggml_cont(ctx0,
+                                            ggml_view_3d(ctx0, cur,
+                                                n_embd/n_head, n_head, N,
+                                                //cur->nb[1]/n_head, cur->nb[1], 0*sizeof(float)*n_embd/n_head));
+                                                 ggml_element_size(cur) * 3 * n_embd/n_head,
+                                                 ggml_element_size(cur) * 3 * n_embd,
+                                                 ggml_element_size(cur) * n_embd/n_head * 0));
+            struct ggml_tensor * Kcur = ggml_cont(ctx0,
+                                            ggml_view_3d(ctx0, cur,
+                                                n_embd/n_head, n_head, N,
+                                                //cur->nb[1]/n_head, cur->nb[1], 1*sizeof(float)*n_embd/n_head));
+                                                ggml_element_size(cur) * 3 * n_embd/n_head,
+                                                ggml_element_size(cur) * 3 * n_embd,
+                                                ggml_element_size(cur) * n_embd/n_head * 1));
+            struct ggml_tensor * Vcur = ggml_cont(ctx0,
+                                            ggml_view_3d(ctx0, cur,
+                                                n_embd/n_head, n_head, N,
+                                                //cur->nb[1]/n_head, cur->nb[1], 2*sizeof(float)*n_embd/n_head));
+                                                ggml_element_size(cur) * 3 * n_embd/n_head,
+                                                ggml_element_size(cur) * 3 * n_embd,
+                                                ggml_element_size(cur) * n_embd/n_head * 1));*/
+            
 
             // using mode = 2 for GPT-NeoX mode
             Qcur = ggml_rope(ctx0, Qcur, n_past, n_rot, 2);
@@ -461,12 +525,22 @@ bool stablelm_eval(
 
             // store key and value to memory
             {
-                Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_embd, N));
+                Vcur = ggml_view_2d(ctx0, Vcur,
+                            n_embd,
+                            N,
+                            ggml_element_size(Vcur) * n_embd,
+                            0);
+                Vcur = ggml_transpose(ctx0, Vcur);
+                //Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_embd, N));
 
-                struct ggml_tensor * k = ggml_view_1d(ctx0, model.memory_k, N*n_embd, (ggml_element_size(model.memory_k)*n_embd)*(il*n_ctx + n_past));
-                struct ggml_tensor * v = ggml_view_2d(ctx0, model.memory_v, N, n_embd,
-                        (   n_ctx)*ggml_element_size(model.memory_v),
-                        (il*n_ctx)*ggml_element_size(model.memory_v)*n_embd + n_past*ggml_element_size(model.memory_v));
+                struct ggml_tensor * k = ggml_view_1d(ctx0, model.memory_k,
+                                            N*n_embd,
+                                            (ggml_element_size(model.memory_k)*n_embd)*(il*n_ctx + n_past));
+                struct ggml_tensor * v = ggml_view_2d(ctx0, model.memory_v,
+                                            N,
+                                            n_embd,
+                                            (   n_ctx)*ggml_element_size(model.memory_v),
+                                            (il*n_ctx)*ggml_element_size(model.memory_v)*n_embd + n_past*ggml_element_size(model.memory_v));
 
                 ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Kcur, k));
                 ggml_build_forward_expand(&gf, ggml_cpy(ctx0, Vcur, v));
@@ -482,7 +556,9 @@ bool stablelm_eval(
             struct ggml_tensor * K =
                 ggml_permute(ctx0,
                         ggml_reshape_3d(ctx0,
-                            ggml_view_1d(ctx0, model.memory_k, (n_past + N)*n_embd, il*n_ctx*ggml_element_size(model.memory_k)*n_embd),
+                            ggml_view_1d(ctx0, model.memory_k,
+                                (n_past + N)*n_embd,
+                                il*n_ctx*ggml_element_size(model.memory_k)*n_embd),
                             n_embd/n_head, n_head, n_past + N),
                         0, 2, 1, 3);
 
@@ -490,11 +566,8 @@ bool stablelm_eval(
             struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
 
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
-            struct ggml_tensor * KQ_scaled =
-                ggml_scale(ctx0,
-                        KQ,
-                        ggml_new_f32(ctx0, 1.0f/sqrt(float(n_embd)/n_head))
-                        );
+            struct ggml_tensor * KQ_scaled = ggml_scale(ctx0, KQ,
+                                                ggml_new_f32(ctx0, 1.0f/sqrt(float(n_embd)/n_head)));
 
             // KQ_masked = mask_past(KQ_scaled)
             struct ggml_tensor * KQ_masked = ggml_diag_mask_inf(ctx0, KQ_scaled, n_past);
@@ -503,36 +576,37 @@ bool stablelm_eval(
             struct ggml_tensor * KQ_soft_max = ggml_soft_max(ctx0, KQ_masked);
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-            struct ggml_tensor * V =
-                ggml_view_3d(ctx0, model.memory_v,
-                        n_past + N, n_embd/n_head, n_head,
-                        n_ctx*ggml_element_size(model.memory_v),
-                        n_ctx*ggml_element_size(model.memory_v)*n_embd/n_head,
-                        il*n_ctx*ggml_element_size(model.memory_v)*n_embd);
+            struct ggml_tensor * V_trans = ggml_view_3d(ctx0, model.memory_v,
+                                        n_past + N,
+                                        n_embd/n_head,
+                                        n_head,
+                                        n_ctx*ggml_element_size(model.memory_v),
+                                        n_ctx*ggml_element_size(model.memory_v)*n_embd/n_head,
+                                        il*n_ctx*ggml_element_size(model.memory_v)*n_embd);
 
             // KQV = transpose(V) * KQ_soft_max
-            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V_trans, KQ_soft_max);
 
             // KQV_merged = KQV.permute(0, 2, 1, 3)
             struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
             // cur = KQV_merged.contiguous().view(n_embd, N)
-            cur = ggml_cpy(ctx0,
-                    KQV_merged,
-                    ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N));
+            cur = ggml_cpy(ctx0, KQV_merged,
+                        ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, N));
 
             // projection
             {
-                cur = ggml_mul_mat(ctx0,
-                        model.layers[il].c_attn_proj_w,
-                        cur);
+                cur = ggml_mul_mat(ctx0, model.layers[il].c_attn_proj_w, cur);
 
                 cur = ggml_add(ctx0, ggml_repeat(ctx0, model.layers[il].c_attn_proj_b, cur), cur);
             }
         }
+        
+        //lctx.use_buf(ctx0, 1);
 
         struct ggml_tensor * inpFF = cur;
 
+        // TODO: This version assumes hparam use_parallel_residual to be true, would make more sense to just include it in the model hparams from hf and to have one more if clause to process true/false cases, this would make it compatible with most gptneox models and still work with stablelm, although most gptneox models I see use use_parallel_residual... stablelm works just fine with my gptneox.cpp fork of llama.cpp
         // feed-forward network
         // this is independent of the self-attention result, so it could be done in parallel to the self-attention
         {
@@ -548,9 +622,7 @@ bool stablelm_eval(
                     ggml_repeat(ctx0, model.layers[il].ln_2_b, cur));
             }
 
-            cur = ggml_mul_mat(ctx0,
-                    model.layers[il].c_mlp_fc_w,
-                    cur);
+            cur = ggml_mul_mat(ctx0, model.layers[il].c_mlp_fc_w, cur);
 
             cur = ggml_add(ctx0,
                     ggml_repeat(ctx0, model.layers[il].c_mlp_fc_b, cur),
@@ -561,9 +633,7 @@ bool stablelm_eval(
 
             // projection
             // cur = proj_w*cur + proj_b
-            cur = ggml_mul_mat(ctx0,
-                    model.layers[il].c_mlp_proj_w,
-                    cur);
+            cur = ggml_mul_mat(ctx0, model.layers[il].c_mlp_proj_w, cur);
 
             cur = ggml_add(ctx0,
                     ggml_repeat(ctx0, model.layers[il].c_mlp_proj_b, cur),
@@ -576,6 +646,8 @@ bool stablelm_eval(
         // input for next layer
         inpL = ggml_add(ctx0, cur, inpL);
     }
+    
+    //lctx.use_buf(ctx0, 0);
 
     // norm
     {
@@ -597,6 +669,8 @@ bool stablelm_eval(
         //        ggml_repeat(ctx0, model.lmh_b, inpL),
         //        inpL);
     }
+    
+    //lctx.use_buf(ctx0, -1);
 
     // logits -> probs
     //inpL = ggml_soft_max(ctx0, inpL);
@@ -627,6 +701,7 @@ bool stablelm_eval(
     return true;
 }
 
+// TODO: Replace this main in favor or the interactive main-gptneox version from https://github.com/byroneverson/gptneox.cpp or similar
 int main(int argc, char ** argv) {
     const int64_t t_main_start_us = ggml_time_us();
 
@@ -642,6 +717,9 @@ int main(int argc, char ** argv) {
     }
 
     printf("%s: seed = %d\n", __func__, params.seed);
+    printf("%s: top_k = %d\n", __func__, params.top_k);
+    printf("%s: top_p = %d\n", __func__, params.top_p);
+    printf("%s: temp = %d\n", __func__, params.temp);
 
     std::mt19937 rng(params.seed);
     if (params.prompt.empty()) {
@@ -678,17 +756,42 @@ int main(int argc, char ** argv) {
     int64_t t_predict_us = 0;
 
     std::vector<float> logits;
-
-    // tokenize the prompt
+    
+    // MARK: "Base" StableLM - are bos or eos tokens used in prompt or just simple sentence completion? in this case bos and eos are the same token id (0), my guess is sentence completion only for base model (no bos/eos)
+    // tokenize the user prompt
     std::vector<gpt_vocab::id> embd_inp = ::gpt_tokenize(vocab, params.prompt);
+    
+    // MARK: "Tuned" StableLM - special tokens are used for a more professional chat assistant
+    /*
+    // special tokens
+    auto prompt_system_id = 50277; //<|SYSTEM|>
+    auto prompt_user_id = 50278; //<|USER|>
+    auto prompt_assistant_id = 50279; //<|ASSISTANT|>
+    // tokenize the system prompt
+    auto system_prompt = "# StableLM Tuned (Alpha version)\n\
+    - StableLM is a helpful and harmless open-source AI language model developed by StabilityAI.\n\
+    - StableLM is excited to be able to help the user, but will refuse to do anything that could be considered harmful to the user.\n\
+    - StableLM is more than just an information source, StableLM is also able to write poetry, short stories, and make jokes.\n\
+    - StableLM will refuse to participate in anything that could harm a human.";
+    std::vector<gpt_vocab::id> system_prompt_ids = ::gpt_tokenize(vocab, system_prompt);
+    // tokenize the user prompt
+    std::vector<gpt_vocab::id> user_prompt_ids = ::gpt_tokenize(vocab, params.prompt);
+    // concat all token ids for embd_inp
+    std::vector<gpt_vocab::id> embd_inp = std::vector<gpt_vocab::id>();
+    embd_inp.push_back(prompt_system_id); // system
+    embd_inp.insert(embd_inp.end(), system_prompt_ids.begin(), system_prompt_ids.end());
+    embd_inp.push_back(prompt_user_id); // user
+    embd_inp.insert(embd_inp.end(), user_prompt_ids.begin(), user_prompt_ids.end());
+    embd_inp.push_back(prompt_assistant_id); // assistant
+     */
 
     params.n_predict = std::min(params.n_predict, model.hparams.n_ctx - (int) embd_inp.size());
 
     printf("%s: number of tokens in prompt = %zu\n", __func__, embd_inp.size());
-    for (int i = 0; i < embd_inp.size(); i++) {
-        printf("%s: token[%d] = %6d, %s\n", __func__, i, embd_inp[i], vocab.id_to_token.at(embd_inp[i]).c_str());
-    }
-    printf("\n");
+    //for (int i = 0; i < embd_inp.size(); i++) {
+    //    printf("%s: token[%d] = %6d, %s\n", __func__, i, embd_inp[i], vocab.id_to_token.at(embd_inp[i]).c_str());
+    //}
+    //printf("\n");
 
     std::vector<gpt_vocab::id> embd;
 
@@ -725,7 +828,7 @@ int main(int argc, char ** argv) {
             {
                 const int64_t t_start_sample_us = ggml_time_us();
 
-                id = gpt_sample_top_k_top_p(vocab, logits.data() + (logits.size() - n_vocab), top_k, top_p, temp, rng);
+                id = gpt_sample_top_k_top_p(vocab, logits.data() /*+ (logits.size() - n_vocab)*/, top_k, top_p, temp, rng);
 
                 t_sample_us += ggml_time_us() - t_start_sample_us;
             }

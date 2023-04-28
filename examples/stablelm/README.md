@@ -52,6 +52,7 @@ cmake ..
 make -j
 
 # get the StableLM 3B Alpha model
+# this is painfully slower than loading an hf model to a cache_dir for some reason, is what it is
 git clone https://huggingface.co/stabilityai/stablelm-base-alpha-3b
 
 # convert model to FP16
